@@ -1,0 +1,25 @@
+# GDELT 뉴스 수집 파이프라인 의존성
+# pip install -r requirements.txt
+
+# 데이터 처리
+pandas>=2.0.0
+pyarrow>=14.0.0
+numpy>=1.26.0
+
+# BigQuery (방법 1: BigQuery 수집기)
+google-cloud-bigquery>=3.13.0
+google-cloud-bigquery-storage>=2.24.0   # 빠른 다운로드용
+db-dtypes>=1.2.0
+
+# HTTP 수집 (방법 2: DOC API, 방법 3: 직접 다운로드)
+requests>=2.31.0
+urllib3>=2.0.0
+
+# 중복 제거 (TF-IDF 유사도)
+scikit-learn>=1.3.0
+
+# 진행 표시
+tqdm>=4.66.0
+
+# 로깅·유틸리티
+python-dateutil>=2.8.2

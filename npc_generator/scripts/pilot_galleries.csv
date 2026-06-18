@@ -1,0 +1,6 @@
+gallery_id,gallery_name,gallery_type,activity_guess
+stock,주식,major,high
+bitcoins_new1,비트코인,major,high
+kospi,코스피,major,mid
+economy,경제,major,mid
+overseastock,해외주식,major,mid

@@ -1,0 +1,661 @@
+# ============================================================
+# pr_dci06_build_llm_generation_requests.py
+#
+# 입력:
+#   data/processed/dci_llm_event_inputs_with_event_contexts/
+#     event_thread_units_with_event_contexts.jsonl
+#
+# 출력:
+#   data/processed/dci_llm_generation_requests/
+#     llm_generation_requests_all.jsonl
+#     llm_generation_requests_factual_news_needed.jsonl
+#     llm_generation_requests_market_reaction_news.jsonl
+#     llm_generation_requests_rumor_or_speculation.jsonl
+#     llm_generation_requests_community_reaction_only.jsonl
+#     llm_generation_request_preview.csv
+#     llm_generation_request_report.txt
+#
+# 목적:
+#   OpenAI Batch API 또는 일반 API 호출용 JSONL 생성
+# ============================================================
+
+import argparse
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+
+import pandas as pd
+
+
+@dataclass
+class LlmRequestConfig:
+    project_root: Path
+    input_jsonl: Path
+    output_dir: Path
+
+    model: str = "gpt-4o"
+    max_tokens: int = 360
+    temperature: float = 0.72
+
+    max_threads: int = 2
+    max_comments_per_thread: int = 6
+    thread_body_chars: int = 160
+    comment_chars: int = 80
+
+    include_types: Optional[List[str]] = None
+    limit_per_type: Dict[str, int] = field(default_factory=dict)
+
+    def included_type_set(self) -> Optional[Set[str]]:
+        if not self.include_types:
+            return None
+        return set(self.include_types)
+
+
+class PromptBuilder:
+    SYSTEM_PROMPT = (
+        "투자 게임용 한국어 종목 이벤트 문장을 만든다.\n"
+        "- 출력은 JSON 하나만 쓴다.\n"
+        "- evidence 밖의 사실·수치·원인을 만들지 않는다.\n"
+        "- 존댓말을 쓰지 않는다. '~습니다', '~합니다', '~해요', '~네요', '~죠' 금지.\n"
+        "- DART가 있을 때만 공식 사실로 쓴다.\n"
+        "- 가격/거래량은 주어진 label만 쓴다. label이 급등/급락이면 거래량 언급 금지. label이 거래량급증일 때만 거래량을 쓴다.\n"
+        "- 가격/거래량의 이유를 단정하지 않는다.\n"
+        "- mood_context는 당시 시장 분위기 참고용이다. 날짜와 제목이 있어도 종목 등락의 원인으로 연결하지 않는다.\n"
+        "- 커뮤니티 글은 말투·반응 참고용이며, 그 자체를 사건으로 만들지 않는다.\n"
+        "- thread 내용이 종목과 직접 연결되지 않으면 종목 사건처럼 쓰지 않고 일반적인 게시판 분위기로만 쓴다.\n"
+        "- threads가 비어 있으면 community_line은 빈 문자열로 둔다.\n"
+        "- 내부 데이터 표현(댓글 수, 반응 증가, 관심 확대, 점수, 지표, 급증률)을 쓰지 않는다.\n"
+        "- 신문 클리셰·전망성 상투구를 피하고 짧고 건조하게 쓴다.\n"
+        "- 혐오표현, 노골적 성표현, 개인정보는 쓰지 않는다."
+    )
+
+
+    TYPE_RULES = {
+        "factual_news_needed": (
+            "공시명에서 확인되는 사실만 짧은 뉴스 메모처럼 정리한다. "
+            "제목은 명사형으로 쓴다. 본문은 건조한 서술체로 쓴다. 존댓말 금지. "
+            "DART 공시만 공식 사실 근거다. "
+            "공시에 없는 수치·상대방·실적·원인·세부 내용은 만들지 않는다. "
+            "가격/거래량 정보가 있더라도 공시와 인과로 묶지 않는다. "
+            "threads가 없으면 community_line은 빈 문자열로 둔다."
+        ),
+        "market_reaction_news": (
+            "가격 또는 거래량 반응만 짧게 전한다. "
+            "제목은 명사형으로 쓴다. 본문은 건조한 서술체로 쓴다. 존댓말 금지. "
+            "price_move가 급등이면 주가 상승만 쓴다. 급락이면 주가 하락만 쓴다. "
+            "price_move가 거래량급증일 때만 거래량을 언급한다. "
+            "이유는 확인되지 않은 상태로 둔다. 새 사건을 만들지 않는다. "
+            "mood_context를 등락 원인으로 쓰지 않는다. "
+            "threads가 없으면 community_line은 빈 문자열로 둔다."
+        ),
+        "rumor_or_speculation": (
+            "뉴스가 아니다. 종토방에서 도는 기대·불안·추측을 짧은 반말/게시판 말투로 요약한다. "
+            "제목은 기사 제목이 아니라 커뮤니티 반응 요약처럼 쓴다. 존댓말 금지. "
+            "확정·발표·공식 확인처럼 쓰지 않는다. "
+            "thread가 해당 종목과 약하게만 연결되어 있으면 종목별 사실이나 사건으로 쓰지 않는다. "
+            "댓글에 공시·뉴스·실적·계약·유증 언급이 있어도 확인된 사실처럼 쓰지 않고, "
+            "커뮤니티에서 그런 말이 돈다는 분위기로만 쓴다."
+        ),
+        "community_reaction_only": (
+            "뉴스가 아니다. 사건을 만들지 않고 게시판 분위기만 짧은 반말/게시판 말투로 옮긴다. "
+            "제목은 기사 제목이 아니라 반응 요약처럼 쓴다. 존댓말 금지. "
+            "원인·공시·확정 사실을 생성하지 않는다. "
+            "thread가 해당 종목과 약하게만 연결되어 있으면 종목별 사실이나 사건으로 쓰지 않는다. "
+            "댓글에 공시·뉴스·실적·계약·유증 언급이 있어도 확인된 사실처럼 쓰지 않고, "
+            "커뮤니티에서 그런 말이 돈다는 분위기로만 쓴다."
+        ),
+    }
+
+    OUTPUT_SHAPES = {
+        "factual_news_needed": '{"headline":"명사형 짧은 제목","body":"2~3문장. 건조한 서술체. 존댓말 금지","community_line":"threads가 있으면 반응 한 문장, 없으면 빈 문자열"}',
+        "market_reaction_news": '{"headline":"명사형 짧은 제목","body":"2~3문장. 주어진 price_move만 언급. 존댓말 금지","community_line":"threads가 있으면 반응 한 문장, 없으면 빈 문자열"}',
+        "rumor_or_speculation": '{"headline":"커뮤니티식 짧은 요약. 존댓말 금지","community_line":"추측/기대/불안 2문장. 반말/게시판 말투"}',
+        "community_reaction_only": '{"headline":"반응 짧은 요약. 존댓말 금지","community_line":"종토방 분위기 2문장. 반말/게시판 말투"}',
+    }
+
+    NEWS_TYPES = {"factual_news_needed", "market_reaction_news"}
+
+    def __init__(self, config: LlmRequestConfig):
+        self.config = config
+
+    def build_messages(self, unit: Dict) -> List[Dict]:
+        event_type = unit.get("event_generation_candidate_type", "")
+
+        user_payload = {
+            "type": event_type,
+            "rule": self.TYPE_RULES.get(event_type, ""),
+            "output": self.OUTPUT_SHAPES.get(event_type, "{}"),
+            "context": self._build_context(unit, event_type),
+            "threads": self._trim_threads(
+                threads=unit.get("source_threads", []),
+                stock_name=unit.get("stock", {}).get("stock_name", ""),
+                event_type=event_type,
+            ),
+        }
+
+        return [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(user_payload, ensure_ascii=False, separators=(",", ":")),
+            },
+        ]
+
+    def _build_context(self, unit: Dict, event_type: str) -> Dict:
+        context = {
+            "id": unit.get("candidate_id", ""),
+            "date": unit.get("candidate_date", ""),
+            "stock": self._build_stock_identity(unit.get("stock", {})),
+        }
+
+        # rumor/community는 구조적으로 threads only에 가깝게 유지한다.
+        # 단, date/stock은 출력 식별을 위해 최소한으로 남긴다.
+        if event_type not in self.NEWS_TYPES:
+            return context
+
+        evidence = unit.get("evidence", {})
+        market = evidence.get("market", {})
+        dart = evidence.get("dart", {})
+
+        if event_type == "factual_news_needed" and self._as_bool(dart.get("has_factual_evidence", 0)):
+            context["dart"] = self._build_dart_context(dart)
+
+        price_label = self._build_price_label(market)
+        if price_label:
+            context["price_move"] = price_label
+
+        mood_context = self._build_mood_context(
+            macro_context=unit.get("macro_context", {}),
+            stock_event_context=unit.get("stock_event_context", {}),
+        )
+        if mood_context:
+            context["mood_context"] = mood_context
+
+        return context
+
+    @staticmethod
+    def _build_stock_identity(stock: Dict) -> Dict:
+        result = {}
+        for key in ("stock_code", "stock_name"):
+            value = stock.get(key, "")
+            if value not in (None, ""):
+                result[key] = value
+        return result
+
+    @staticmethod
+    def _build_dart_context(dart: Dict) -> Dict:
+        result = {}
+        dates = dart.get("dart_dates", "")
+        groups = dart.get("dart_event_groups", "")
+        reports = dart.get("dart_report_names", "")
+
+        if dates:
+            result["dates"] = dates
+        if groups:
+            result["groups"] = groups
+        if reports:
+            result["reports"] = reports
+
+        return result
+
+    def _build_price_label(self, market: Dict) -> str:
+        if not self._as_bool(market.get("has_market_evidence", 0)):
+            return ""
+
+        has_price = self._as_bool(market.get("has_price_shock", 0))
+        has_volume = self._as_bool(market.get("has_volume_shock", 0))
+
+        if has_price:
+            market_return = self._to_float(market.get("market_return_pct", 0))
+            if market_return > 0:
+                return "급등"
+            if market_return < 0:
+                return "급락"
+            return "변동"
+
+        if has_volume:
+            return "거래량급증"
+
+        return "변동"
+
+    def _build_mood_context(self, macro_context: Dict, stock_event_context: Dict) -> Dict:
+        macro_items = self._build_mood_items(macro_context)
+        stock_items = self._build_mood_items(stock_event_context)
+
+        mood = {}
+        if macro_items:
+            mood["macro"] = macro_items
+        if stock_items:
+            mood["stock"] = stock_items
+
+        return mood
+
+    def _build_mood_items(self, ctx: Dict) -> List[str]:
+        items = []
+        for event in ctx.get("events", [])[:2]:
+            title = str(event.get("title", "")).strip()
+            if not title:
+                continue
+
+            date = str(event.get("event_date", "")).strip()
+            text = f"{date} {title}".strip() if date else title
+            items.append(self._cut(text, 80))
+
+        return items
+
+    def _trim_threads(self, threads: List[Dict], stock_name: str = "", event_type: str = "") -> List[Dict]:
+        trimmed = []
+        require_direct_stock_mention = event_type in {
+            "rumor_or_speculation",
+            "community_reaction_only",
+        }
+
+        for thread in threads:
+            comments = thread.get("comments", [])
+
+            if require_direct_stock_mention and not self._thread_mentions_stock(thread, stock_name):
+                continue
+
+            comments = comments[: self.config.max_comments_per_thread]
+
+            item = {
+                "title": self._cut(thread.get("title", ""), self.config.thread_body_chars),
+                "body": self._cut(thread.get("body", ""), self.config.thread_body_chars),
+                "comments": [
+                    self._cut(comment.get("text", ""), self.config.comment_chars)
+                    for comment in comments
+                    if comment.get("text", "")
+                ],
+            }
+
+            if item["title"] or item["body"] or item["comments"]:
+                trimmed.append(item)
+
+            if len(trimmed) >= self.config.max_threads:
+                break
+
+        return trimmed
+
+    @staticmethod
+    def _thread_mentions_stock(thread: Dict, stock_name: str) -> bool:
+        if not stock_name:
+            return False
+
+        target = str(stock_name).strip()
+        if not target:
+            return False
+
+        texts = [
+            str(thread.get("title", "")),
+            str(thread.get("body", "")),
+        ]
+
+        for comment in thread.get("comments", []):
+            texts.append(str(comment.get("text", "")))
+
+        joined = "\n".join(texts)
+
+        # 기본: 종목명이 직접 등장해야 함
+        if target in joined:
+            return True
+
+        # 공백 제거 기준 보정
+        compact_target = re.sub(r"\s+", "", target)
+        compact_joined = re.sub(r"\s+", "", joined)
+
+        if compact_target and compact_target in compact_joined:
+            return True
+
+        return False
+
+    @staticmethod
+    def _cut(value: object, max_chars: int) -> str:
+        if value is None:
+            return ""
+
+        s = str(value).strip()
+        if len(s) <= max_chars:
+            return s
+
+        return s[:max_chars].rstrip() + "..."
+
+    @staticmethod
+    def _as_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y"}
+        return bool(value)
+
+    @staticmethod
+    def _to_float(value: object) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+class LlmRequestBuilder:
+    MAX_TOKENS_BY_TYPE = {
+        "factual_news_needed": 380,
+        "market_reaction_news": 360,
+        "rumor_or_speculation": 200,
+        "community_reaction_only": 160,
+    }
+
+    THREAD_REQUIRED_TYPES = {
+        "rumor_or_speculation",
+        "community_reaction_only",
+    }
+
+    def __init__(self, config: LlmRequestConfig):
+        self.config = config
+        self.prompt_builder = PromptBuilder(config)
+
+    def load_units(self) -> List[Dict]:
+        units = []
+
+        with open(self.config.input_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                units.append(json.loads(line))
+
+        print(f"[LOAD] units: {len(units):,}")
+        return units
+
+    def build_request(self, unit: Dict) -> Dict:
+        candidate_id = unit.get("candidate_id", "")
+        event_type = unit.get("event_generation_candidate_type", "unknown")
+        max_tokens = self.MAX_TOKENS_BY_TYPE.get(event_type, self.config.max_tokens)
+
+        return {
+            "custom_id": f"{event_type}__{candidate_id}",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": self.config.model,
+                "messages": self.prompt_builder.build_messages(unit),
+                "temperature": self.config.temperature,
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+            },
+        }
+
+    def build_all(self) -> List[Dict]:
+        units = self.load_units()
+        requests = []
+        included_types = self.config.included_type_set()
+        counts_by_type: Dict[str, int] = {}
+
+        for unit in units:
+            event_type = unit.get("event_generation_candidate_type", "")
+
+            if event_type == "discard":
+                continue
+
+            if included_types is not None and event_type not in included_types:
+                continue
+
+            if event_type in self.THREAD_REQUIRED_TYPES and not unit.get("source_threads"):
+                continue
+
+            limit = self.config.limit_per_type.get(event_type)
+            current_count = counts_by_type.get(event_type, 0)
+            if limit is not None and current_count >= limit:
+                continue
+
+            req = self.build_request(unit)
+
+            if event_type in self.THREAD_REQUIRED_TYPES:
+                payload = json.loads(req["body"]["messages"][1]["content"])
+                if not payload.get("threads"):
+                    continue
+
+            requests.append(req)
+            counts_by_type[event_type] = current_count + 1
+
+        print(f"[BUILD] requests: {len(requests):,}")
+        return requests
+
+
+class LlmRequestWriter:
+    def __init__(self, config: LlmRequestConfig):
+        self.config = config
+
+    def write(self, requests: List[Dict]) -> None:
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+
+        all_path = self.config.output_dir / "llm_generation_requests_all.jsonl"
+        preview_path = self.config.output_dir / "llm_generation_request_preview.csv"
+        report_path = self.config.output_dir / "llm_generation_request_report.txt"
+
+        self._write_jsonl(all_path, requests)
+
+        by_type: Dict[str, List[Dict]] = {}
+        for req in requests:
+            event_type = req["custom_id"].split("__", 1)[0]
+            by_type.setdefault(event_type, []).append(req)
+
+        for event_type, reqs in by_type.items():
+            path = self.config.output_dir / f"llm_generation_requests_{event_type}.jsonl"
+            self._write_jsonl(path, reqs)
+
+        preview = self._build_preview(requests)
+        preview.to_csv(preview_path, index=False, encoding="utf-8-sig")
+
+        self._write_report(requests, by_type, report_path)
+
+        print(f"[SAVE] {all_path}")
+        print(f"[SAVE] {preview_path}")
+        print(f"[SAVE] {report_path}")
+
+        for event_type in sorted(by_type):
+            path = self.config.output_dir / f"llm_generation_requests_{event_type}.jsonl"
+            print(f"[SAVE] {event_type}: {path}")
+
+    @staticmethod
+    def _write_jsonl(path: Path, rows: List[Dict]) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _build_preview(requests: List[Dict]) -> pd.DataFrame:
+        rows = []
+
+        for req in requests:
+            custom_id = req["custom_id"]
+            event_type, candidate_id = custom_id.split("__", 1)
+
+            messages = req["body"]["messages"]
+            user_content = messages[1]["content"]
+
+            try:
+                payload = json.loads(user_content)
+                context = payload.get("context", {})
+                stock = context.get("stock", {})
+                threads = payload.get("threads", [])
+                mood_context = context.get("mood_context", {})
+            except Exception:
+                context = {}
+                stock = {}
+                threads = []
+                mood_context = {}
+
+            rows.append({
+                "custom_id": custom_id,
+                "candidate_id": candidate_id,
+                "event_type": event_type,
+                "candidate_date": context.get("date", ""),
+                "stock_code": stock.get("stock_code", ""),
+                "stock_name": stock.get("stock_name", ""),
+                "source_thread_count": len(threads),
+                "has_dart": int("dart" in context),
+                "price_move": context.get("price_move", ""),
+                "macro_mood_count": len(mood_context.get("macro", [])) if isinstance(mood_context, dict) else 0,
+                "stock_mood_count": len(mood_context.get("stock", [])) if isinstance(mood_context, dict) else 0,
+                "model": req["body"].get("model", ""),
+                "temperature": req["body"].get("temperature", ""),
+                "max_tokens": req["body"].get("max_tokens", ""),
+            })
+
+        return pd.DataFrame(rows)
+
+    def _write_report(self, requests: List[Dict], by_type: Dict[str, List[Dict]], path: Path) -> None:
+        lines = []
+        included_types = self.config.include_types or ["ALL"]
+
+        lines.append("# LLM Generation Request Report")
+        lines.append("")
+        lines.append("## Input")
+        lines.append(f"- input_jsonl: {self.config.input_jsonl}")
+        lines.append("")
+        lines.append("## Config")
+        lines.append(f"- model: {self.config.model}")
+        lines.append(f"- fallback_max_tokens: {self.config.max_tokens}")
+        lines.append(f"- temperature: {self.config.temperature}")
+        lines.append(f"- max_threads: {self.config.max_threads}")
+        lines.append(f"- max_comments_per_thread: {self.config.max_comments_per_thread}")
+        lines.append(f"- thread_body_chars: {self.config.thread_body_chars}")
+        lines.append(f"- comment_chars: {self.config.comment_chars}")
+        lines.append(f"- include_types: {', '.join(included_types)}")
+        lines.append(f"- limit_per_type: {self.config.limit_per_type if self.config.limit_per_type else '{}'}")
+        lines.append("")
+        lines.append("## Max tokens by type")
+        for event_type, max_tokens in sorted(LlmRequestBuilder.MAX_TOKENS_BY_TYPE.items()):
+            lines.append(f"- {event_type}: {max_tokens}")
+        lines.append("")
+        lines.append("## Counts")
+        lines.append(f"- total_requests: {len(requests):,}")
+        lines.append("")
+        lines.append("## By type")
+
+        for event_type, reqs in sorted(by_type.items()):
+            lines.append(f"- {event_type}: {len(reqs):,}")
+
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write("\n".join(lines))
+
+
+class LlmRequestPipeline:
+    def __init__(self, config: LlmRequestConfig):
+        self.config = config
+
+    def run(self) -> None:
+        requests = LlmRequestBuilder(self.config).build_all()
+        LlmRequestWriter(self.config).write(requests)
+
+        print("\n[DONE]")
+        print(f"output_dir: {self.config.output_dir}")
+
+
+def parse_limit_per_type(items: Optional[List[str]]) -> Dict[str, int]:
+    if not items:
+        return {}
+
+    result = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"invalid --limit-per-type item: {item}. expected format: type=count")
+
+        event_type, raw_count = item.split("=", 1)
+        event_type = event_type.strip()
+        raw_count = raw_count.strip()
+
+        if not event_type:
+            raise ValueError(f"invalid --limit-per-type item: {item}. empty type")
+
+        try:
+            count = int(raw_count)
+        except ValueError as exc:
+            raise ValueError(f"invalid count in --limit-per-type item: {item}") from exc
+
+        if count < 0:
+            raise ValueError(f"invalid count in --limit-per-type item: {item}. count must be >= 0")
+
+        result[event_type] = count
+
+    return result
+
+
+def build_config_from_args() -> LlmRequestConfig:
+    project_root = Path(__file__).resolve().parent.parent
+
+    default_input_jsonl = (
+        project_root
+        / "data"
+        / "processed"
+        / "dci_llm_event_inputs_with_event_contexts"
+        / "event_thread_units_with_event_contexts.jsonl"
+    )
+
+    default_output_dir = (
+        project_root
+        / "data"
+        / "processed"
+        / "dci_llm_generation_requests"
+    )
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--input-jsonl", type=str, default=str(default_input_jsonl))
+    parser.add_argument("--output-dir", type=str, default=str(default_output_dir))
+
+    parser.add_argument("--model", type=str, default="gpt-4o")
+    parser.add_argument("--max-tokens", type=int, default=360)
+    parser.add_argument("--temperature", type=float, default=0.72)
+
+    parser.add_argument("--max-threads", type=int, default=2)
+    parser.add_argument("--max-comments-per-thread", type=int, default=6)
+    parser.add_argument("--thread-body-chars", type=int, default=160)
+    parser.add_argument("--comment-chars", type=int, default=80)
+
+    parser.add_argument(
+        "--include-types",
+        nargs="+",
+        default=None,
+        help="Only build requests for these event types. Example: --include-types factual_news_needed market_reaction_news",
+    )
+    parser.add_argument(
+        "--limit-per-type",
+        nargs="*",
+        default=None,
+        help="Optional sample limits. Example: --limit-per-type factual_news_needed=20 market_reaction_news=20",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        limit_per_type = parse_limit_per_type(args.limit_per_type)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    return LlmRequestConfig(
+        project_root=project_root,
+        input_jsonl=Path(args.input_jsonl).expanduser().resolve(),
+        output_dir=Path(args.output_dir).expanduser().resolve(),
+        model=args.model,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        max_threads=args.max_threads,
+        max_comments_per_thread=args.max_comments_per_thread,
+        thread_body_chars=args.thread_body_chars,
+        comment_chars=args.comment_chars,
+        include_types=args.include_types,
+        limit_per_type=limit_per_type,
+    )
+
+
+def main() -> None:
+    config = build_config_from_args()
+    LlmRequestPipeline(config).run()
+
+
+if __name__ == "__main__":
+    main()

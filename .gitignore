@@ -1,0 +1,78 @@
+# 환경 변수 (API 키 등 민감 정보)
+.env
+.env.*
+*.env
+
+# Python 가상환경
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Node.js
+node_modules/
+dist/
+.next/
+.nuxt/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 로그
+*.log
+logs/
+
+# 기타
+*.pem
+*.key
+
+# 데이터 폴더 (Google Drive로 관리)
+data/
+bond_universe/data/
+crypto_universe/data/
+market_indicator/data/
+news_generator/data/
+npc_generator/data/
+demo/*.csv
+fnguide_list.txt
+stocklist.txt
+*.parquet
+**/output/
+**/outputs/
+
+# 업로드 스크립트 부산물
+upload_log.txt
+token.json
+
+# 독립 git 저장소 (별도 관리)
+stock-game-sample/
+
+# Claude 로컬 설정
+.claude/
+
+# DART 수집 데이터 (대용량)
+news_generator/dart_collector/dart_results*.json
+news_generator/dart_collector/corp_code_cache.xml
+news_generator/dart_collector/dart_results.json
+
+# GCP 서비스 계정 키 (민감 정보)
+*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.json
+news_generator/scripts/bold-lantern-*.json
+
+# 이미지·HTML 디버그 산출물
+*.png
+*.html

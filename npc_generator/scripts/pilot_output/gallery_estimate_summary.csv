@@ -1,0 +1,11 @@
+﻿gallery_id,gallery_name,gallery_type,activity_guess,posts_30d,avg_posts_per_day,sampled_detail_posts,avg_comments_per_post,median_comments_per_post,p90_comments_per_post,avg_up_count,avg_down_count,detail_fetch_success_rate,expected_posts_per_year,expected_comments_per_year
+stock,주식,major,high,0,0.0,0,0.0,0.0,0.0,0.0,0.0,0.0,0,0
+bitcoins_new1,비트코인,major,high,0,0.0,0,0.0,0.0,0.0,0.0,0.0,0.0,0,0
+kospi,코스피,major,mid,0,0.0,0,0.0,0.0,0.0,0.0,0.0,0.0,0,0
+economy,경제,major,mid,0,0.0,0,0.0,0.0,0.0,0.0,0.0,0.0,0,0
+overseastock,해외주식,major,mid,0,0.0,0,0.0,0.0,0.0,0.0,0.0,0.0,0,0
+stock,주식,G,high,2,0,0.0,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0
+bitcoins_new1,비트코인,G,high,3,2,0.0667,2,2,7.5,7.5,8.7,11.0,1.0,1894.5,2.5,0.0,1.0,24,180
+kospi,코스피,G,mid,1,0,0.0,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0
+economy,경제,G,mid,2,0,0.0,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0
+overseastock,해외주식,G,mid,1,0,0.0,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0

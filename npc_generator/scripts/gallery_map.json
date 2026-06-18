@@ -1,0 +1,231 @@
+{
+  "base_galleries": {
+    "미국주식갤": "stockus",
+    "한국주식갤": "krstock",
+    "코스피갤": "kospi",
+    "나스닥갤": "nasdaq",
+    "해외주식갤": "tenbagger",
+    "반도체산업갤": "tsmcsamsungskhynix"
+  },
+  "confirmed": {},
+  "review": {
+    "SK하이닉스": {
+      "gall_id": "skhynix",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "LG": {
+      "gall_id": "lg",
+      "gall_type": "board",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "KCC": {
+      "gall_id": "kcc",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "현대차": {
+      "gall_id": "hmc",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "HL홀딩스": {
+      "gall_id": "hl",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "한국앤컴퍼니": {
+      "gall_id": "hankook",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "한국항공우주": {
+      "gall_id": "kai",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "키움증권": {
+      "gall_id": "kiwoom",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "SK텔레콤": {
+      "gall_id": "sktt",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "쿠쿠홀딩스": {
+      "gall_id": "cuckoo",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "KT&G": {
+      "gall_id": "ktng",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "S-Oil": {
+      "gall_id": "soil",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "카카오": {
+      "gall_id": "kakao",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "스튜디오드래곤": {
+      "gall_id": "dragon",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "신한지주": {
+      "gall_id": "shinhan",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "셀트리온": {
+      "gall_id": "celltrion",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "삼성바이오로직스": {
+      "gall_id": "sbio",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "이마트": {
+      "gall_id": "emart",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "대한항공": {
+      "gall_id": "koreanair",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "인바디": {
+      "gall_id": "inbody",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "파마리서치": {
+      "gall_id": "pharma",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "한솔케미칼": {
+      "gall_id": "hansol",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "DL": {
+      "gall_id": "dl",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "금호석유화학": {
+      "gall_id": "kumho",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "한전기술": {
+      "gall_id": "kepcotech",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "크래프톤": {
+      "gall_id": "krafton",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "JYP Ent.": {
+      "gall_id": "jypent",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    },
+    "카카오뱅크": {
+      "gall_id": "kakaobank",
+      "gall_type": "mgallery",
+      "gall_name": "잘못한 것보다 더 욕먹은 것 같은 스타는?"
+    }
+  },
+  "not_found": [
+    "삼성물산",
+    "효성",
+    "한국타이어앤테크놀로지",
+    "고려아연",
+    "롯데케미칼",
+    "BGF",
+    "롯데정밀화학",
+    "에스원",
+    "삼성증권",
+    "한국금융지주",
+    "코웨이",
+    "삼성카드",
+    "삼성생명",
+    "SK",
+    "강원랜드",
+    "NAVER",
+    "엔씨소프트",
+    "컴투스",
+    "펄어비스",
+    "서울반도체",
+    "아바텍",
+    "토비스",
+    "톱텍",
+    "비아트론",
+    "HB테크놀러지",
+    "미래컴퍼니",
+    "덕산네오룩스",
+    "스카이라이프",
+    "이노션",
+    "제일기획",
+    "현대백화점",
+    "한국전력",
+    "한전KPS",
+    "현대글로비스",
+    "한진칼",
+    "제주항공",
+    "팬오션",
+    "파트론",
+    "고영",
+    "삼성SDI",
+    "씨젠",
+    "아이센스",
+    "HLB",
+    "디오",
+    "뷰웍스",
+    "아모레퍼시픽",
+    "케어젠",
+    "LG생활건강",
+    "리노공업",
+    "한미반도체",
+    "SK케미칼",
+    "OCI홀딩스",
+    "NICE평가정보",
+    "현대로템",
+    "한화에어로스페이스",
+    "미래에셋증권",
+    "메리츠금융지주",
+    "F&F홀딩스",
+    "F&F",
+    "우리기술투자",
+    "SK디스커버리",
+    "골프존",
+    "이녹스첨단소재",
+    "SK바이오사이언스",
+    "호텔신라",
+    "BGF리테일",
+    "한국가스공사",
+    "HMM",
+    "케이엠더블유",
+    "솔브레인홀딩스",
+    "천보",
+    "삼성전기",
+    "더블유씨피",
+    "클래시스",
+    "에스디바이오센서",
+    "삼성전자"
+  ]
+}

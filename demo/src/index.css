@@ -1,0 +1,70 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Pretendard', 'Apple SD Gothic Neo', sans-serif;
+  background: #0f1117;
+  color: #e2e8f0;
+  min-height: 100vh;
+}
+
+/* ── 레이아웃 ── */
+.page          { max-width: 900px; margin: 0 auto; padding: 24px 16px; }
+.card          { background: #1e2130; border: 1px solid #2d3350; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+.row           { display: flex; gap: 12px; flex-wrap: wrap; }
+.col           { flex: 1; min-width: 140px; }
+
+/* ── 타이포 ── */
+h1             { font-size: 1.6rem; font-weight: 700; margin-bottom: 8px; }
+h2             { font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; color: #94a3b8; }
+.label         { font-size: 0.75rem; color: #64748b; margin-bottom: 4px; }
+.value         { font-size: 1.1rem; font-weight: 600; }
+.value-lg      { font-size: 1.4rem; font-weight: 700; }
+.muted         { color: #64748b; font-size: 0.85rem; }
+
+/* ── 수치 색상 ── */
+.pos           { color: #f87171; }   /* 상승 — 빨강 (한국식) */
+.neg           { color: #60a5fa; }   /* 하락 — 파랑 */
+.neu           { color: #94a3b8; }
+
+/* ── 버튼 ── */
+button {
+  cursor: pointer; border: none; border-radius: 8px;
+  padding: 10px 18px; font-size: 0.9rem; font-weight: 600;
+  transition: opacity 0.15s;
+}
+button:hover   { opacity: 0.85; }
+button:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.btn-primary   { background: #3b82f6; color: #fff; }
+.btn-danger    { background: #ef4444; color: #fff; }
+.btn-ghost     { background: #2d3350; color: #e2e8f0; }
+.btn-sm        { padding: 6px 12px; font-size: 0.8rem; }
+
+/* ── 테이블 ── */
+table          { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+th             { text-align: left; color: #64748b; font-weight: 500; padding: 6px 8px; border-bottom: 1px solid #2d3350; }
+td             { padding: 8px 8px; border-bottom: 1px solid #1a1f33; }
+tr:last-child td { border-bottom: none; }
+
+/* ── 로그 ── */
+.log-list      { max-height: 200px; overflow-y: auto; font-size: 0.82rem; color: #94a3b8; }
+.log-item      { padding: 4px 0; border-bottom: 1px solid #1a1f33; }
+
+/* ── 입력 ── */
+input[type="number"] {
+  background: #0f1117; border: 1px solid #2d3350; border-radius: 6px;
+  color: #e2e8f0; padding: 8px 12px; font-size: 0.9rem; width: 100%;
+}
+
+/* ── 상태바 ── */
+.stat-bar-wrap { background: #0f1117; border-radius: 99px; height: 8px; margin-top: 4px; }
+.stat-bar      { height: 8px; border-radius: 99px; transition: width 0.3s; }
+.bar-stress    { background: #f87171; }
+.bar-trust     { background: #34d399; }
+
+/* ── 페이즈 배지 ── */
+.phase-badge {
+  display: inline-block; padding: 3px 10px; border-radius: 99px;
+  font-size: 0.75rem; font-weight: 700; letter-spacing: 0.05em;
+  background: #3b82f6; color: #fff; margin-bottom: 12px;
+}

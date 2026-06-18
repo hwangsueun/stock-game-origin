@@ -1,0 +1,434 @@
+import asyncio
+import json
+import re
+from copy import deepcopy
+from pathlib import Path
+
+import pandas as pd
+from playwright.async_api import async_playwright
+
+SEARCH_URL = "https://map.naver.com/p/search/%EB%B9%B5%EC%A7%91?c=15.00,0,0,0,dh"
+OUTPUT_DIR = Path("naver_review_output")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+TEST_STORE_LIMIT = 10
+EXCLUDE_KEYWORDS = ["파리바게뜨", "파리바게트", "뚜레쥬르"]
+
+# "csv"가 훨씬 빠름. xlsx 필요하면 "xlsx"로 바꾸기
+SAVE_FORMAT = "csv"
+
+LIST_FRAME_KEYWORD = "pcmap.place.naver.com/restaurant/list"
+DETAIL_FRAME_KEYWORD = "pcmap.place.naver.com/restaurant/"
+
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+
+
+def is_excluded_store(name: str) -> bool:
+    return any(keyword in name for keyword in EXCLUDE_KEYWORDS)
+
+
+def flatten_visit_categories(visit_categories):
+    if not visit_categories:
+        return ""
+
+    parts = []
+    for cat in visit_categories:
+        cat = cat or {}
+        cat_name = (cat.get("name") or "").strip()
+        keywords = cat.get("keywords") or []
+        kw_names = [str(k.get("name", "")).strip() for k in keywords if k and k.get("name")]
+
+        if not kw_names:
+            continue
+
+        if cat_name:
+            parts.append(f"{cat_name}: {', '.join(kw_names)}")
+        else:
+            parts.append(", ".join(kw_names))
+
+    return " | ".join(parts)
+
+
+def parse_review_items(items):
+    rows = []
+    for item in items:
+        author = item.get("author") or {}
+        rows.append({
+            "가게명": item.get("businessName", ""),
+            "닉네임": author.get("nickname", ""),
+            "방문정보": flatten_visit_categories(item.get("visitCategories")),
+            "리뷰텍스트": item.get("body", ""),
+            "방문일": item.get("visited", "") or item.get("visitedDate", ""),
+            "작성일": item.get("created", ""),
+            "방문횟수": item.get("visitCount", ""),
+            "원본유형": item.get("originType", ""),
+        })
+    return rows
+
+
+def extract_place_id_from_url(url: str):
+    m = re.search(r"/restaurant/(\d+)", url)
+    return m.group(1) if m else None
+
+
+async def wait_for_frame(page, predicate, retries=40, delay_ms=200):
+    for _ in range(retries):
+        for frame in page.frames:
+            try:
+                if predicate(frame.url):
+                    return frame
+            except:
+                pass
+        await page.wait_for_timeout(delay_ms)
+    return None
+
+
+async def find_list_frame(page):
+    return await wait_for_frame(
+        page,
+        lambda url: LIST_FRAME_KEYWORD in url
+    )
+
+
+async def find_detail_frame(page):
+    return await wait_for_frame(
+        page,
+        lambda url: (DETAIL_FRAME_KEYWORD in url and "/home" in url)
+    )
+
+
+async def collect_top_store_candidates(page, limit=10):
+    list_frame = await find_list_frame(page)
+    if not list_frame:
+        print("검색 결과 리스트 frame을 찾지 못했습니다.")
+        return []
+
+    await list_frame.wait_for_selector("a.YTJkH", timeout=8000)
+
+    store_links = list_frame.locator("a.YTJkH")
+    total = await store_links.count()
+
+    results = []
+    seen_place_ids = set()
+
+    for i in range(total):
+        if len(results) >= limit:
+            break
+
+        try:
+            link = store_links.nth(i)
+            name = (await link.locator("span.TYaxT").inner_text()).strip()
+
+            if not name or is_excluded_store(name):
+                continue
+
+            await link.click(timeout=5000)
+
+            detail_frame = await find_detail_frame(page)
+            if not detail_frame:
+                continue
+
+            place_id = extract_place_id_from_url(detail_frame.url)
+            if not place_id or place_id in seen_place_ids:
+                continue
+
+            detail_name = name
+            try:
+                title_loc = detail_frame.locator("span.GHAhO, span.Fc1rA, div.zD5Nm span").first
+                if await title_loc.count() > 0:
+                    t = (await title_loc.inner_text()).strip()
+                    if t:
+                        detail_name = t
+            except:
+                pass
+
+            seen_place_ids.add(place_id)
+            results.append({
+                "store_name": detail_name,
+                "place_id": place_id,
+            })
+            print(f"[후보] {detail_name} / {place_id}")
+
+        except Exception as e:
+            print(f"[후보 수집 오류] index={i}, error={e}")
+
+    return results
+
+
+async def click_store_in_list(page, target_name):
+    list_frame = await find_list_frame(page)
+    if not list_frame:
+        return False
+
+    links = list_frame.locator("a.YTJkH")
+    cnt = await links.count()
+
+    target_norm = target_name.replace(" ", "")
+
+    best_idx = None
+    best_score = -1
+
+    for i in range(cnt):
+        try:
+            name = (await links.nth(i).locator("span.TYaxT").inner_text()).strip()
+            norm = name.replace(" ", "")
+            score = 0
+
+            if norm == target_norm:
+                score = 100
+            elif target_norm in norm or norm in target_norm:
+                score = 50
+
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        except:
+            continue
+
+    if best_idx is None or best_score < 0:
+        return False
+
+    try:
+        await links.nth(best_idx).click(timeout=5000)
+        return True
+    except:
+        return False
+
+
+async def click_review_tab_and_capture_payload(page, store_name, place_id):
+    detail_frame = await find_detail_frame(page)
+    if not detail_frame:
+        print(f"[{store_name}] 상세 frame 없음")
+        return None
+
+    captured_payload = {"value": None}
+
+    async def handle_response(response):
+        try:
+            req = response.request
+            if "pcmap-api.place.naver.com/graphql" not in response.url:
+                return
+            if req.method != "POST":
+                return
+
+            post_data = req.post_data
+            if not post_data:
+                return
+
+            body = json.loads(post_data)
+            if not isinstance(body, list):
+                return
+
+            for op in body:
+                if op.get("operationName") != "getVisitorReviews":
+                    continue
+
+                variables = op.get("variables", {})
+                input_data = variables.get("input", {})
+                if str(input_data.get("businessId")) == str(place_id):
+                    captured_payload["value"] = op
+                    return
+        except:
+            return
+
+    page.on("response", handle_response)
+
+    try:
+        review_tab = detail_frame.locator('a[role="tab"]:has(span.I2hj8:text("리뷰"))').first
+        await review_tab.wait_for(timeout=7000)
+        await review_tab.click(timeout=5000)
+
+        for _ in range(20):
+            if captured_payload["value"] is not None:
+                break
+            await page.wait_for_timeout(200)
+
+        if captured_payload["value"] is None:
+            try:
+                await detail_frame.mouse.wheel(0, 1000)
+            except:
+                pass
+
+            for _ in range(20):
+                if captured_payload["value"] is not None:
+                    break
+                await page.wait_for_timeout(200)
+
+    finally:
+        try:
+            page.remove_listener("response", handle_response)
+        except:
+            pass
+
+    if captured_payload["value"] is None:
+        print(f"[{store_name}] getVisitorReviews payload 캡처 실패")
+        return None
+
+    print(f"[{store_name}] payload 캡처 성공")
+    return captured_payload["value"]
+
+
+async def fetch_all_reviews_with_captured_payload(api_context, store_name, payload_template):
+    all_rows = []
+    seen_review_ids = set()
+
+    operation = deepcopy(payload_template)
+    variables = operation.setdefault("variables", {})
+    input_data = variables.setdefault("input", {})
+
+    business_id = input_data.get("businessId", "")
+    print(f"[{store_name}] businessId={business_id}")
+
+    page_size = input_data.get("size", 10)
+    if not isinstance(page_size, int):
+        page_size = 10
+        input_data["size"] = 10
+
+    input_data.pop("after", None)
+
+    page_no = 1
+    next_after = None
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Origin": "https://pcmap.place.naver.com",
+        "Referer": "https://pcmap.place.naver.com/",
+    }
+
+    while True:
+        if next_after:
+            input_data["after"] = next_after
+        else:
+            input_data.pop("after", None)
+
+        response = await api_context.post(
+            "https://pcmap-api.place.naver.com/graphql",
+            headers=headers,
+            data=json.dumps([operation], ensure_ascii=False),
+        )
+
+        if not response.ok:
+            print(f"[{store_name}] GraphQL 호출 실패: {response.status}")
+            break
+
+        try:
+            data = await response.json()
+        except Exception as e:
+            print(f"[{store_name}] JSON 파싱 실패: {e}")
+            break
+
+        if not isinstance(data, list) or not data:
+            print(f"[{store_name}] 응답 형식 이상")
+            break
+
+        if data[0].get("errors"):
+            print(f"[{store_name}] GraphQL 에러")
+            print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
+            break
+
+        visitor_reviews = (((data[0] or {}).get("data") or {}).get("visitorReviews") or {})
+        items = visitor_reviews.get("items") or []
+
+        if not items:
+            print(f"[{store_name}] page {page_no}: 더 이상 리뷰 없음")
+            break
+
+        new_rows = []
+        for item in items:
+            rid = item.get("reviewId") or item.get("id")
+            if rid in seen_review_ids:
+                continue
+            seen_review_ids.add(rid)
+            new_rows.extend(parse_review_items([item]))
+
+        all_rows.extend(new_rows)
+        print(f"[{store_name}] page {page_no}: {len(new_rows)}개 추가, 누적 {len(all_rows)}개")
+
+        if len(items) < page_size:
+            print(f"[{store_name}] 마지막 페이지")
+            break
+
+        next_after = items[-1].get("cursor")
+        if not next_after:
+            print(f"[{store_name}] 다음 cursor 없음")
+            break
+
+        page_no += 1
+        await asyncio.sleep(0.1)
+
+    return all_rows
+
+
+def save_store_reviews(store_name, rows):
+    if not rows:
+        print(f"[저장 생략] {store_name}: 저장할 리뷰 없음")
+        return
+
+    df = pd.DataFrame(rows)
+    out_name = sanitize_filename(store_name)
+
+    if SAVE_FORMAT == "xlsx":
+        out_path = OUTPUT_DIR / f"{out_name}.xlsx"
+        df.to_excel(out_path, index=False)
+    else:
+        out_path = OUTPUT_DIR / f"{out_name}.csv"
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
+
+    print(f"[저장 완료] {out_path}")
+
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        print(f"[접속] {SEARCH_URL}")
+        await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=30000)
+
+        candidates = await collect_top_store_candidates(page, limit=TEST_STORE_LIMIT)
+
+        if not candidates:
+            print("수집할 가게를 찾지 못했습니다.")
+            await browser.close()
+            return
+
+        print("\n[최종 대상]")
+        for i, c in enumerate(candidates, start=1):
+            print(i, c["store_name"], c["place_id"])
+
+        for idx, c in enumerate(candidates, start=1):
+            store_name = c["store_name"]
+            place_id = c["place_id"]
+
+            print(f"\n[진행 {idx}/{len(candidates)}] {store_name}")
+
+            clicked = await click_store_in_list(page, store_name)
+            if not clicked:
+                print(f"[{store_name}] 리스트 재클릭 실패. 현재 상세 패널 기준 진행")
+
+            payload_template = await click_review_tab_and_capture_payload(page, store_name, place_id)
+            if not payload_template:
+                print(f"[{store_name}] payload 확보 실패")
+                continue
+
+            rows = await fetch_all_reviews_with_captured_payload(context.request, store_name, payload_template)
+            save_store_reviews(store_name, rows)
+
+        await browser.close()
+        print("\n모든 작업 완료")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
