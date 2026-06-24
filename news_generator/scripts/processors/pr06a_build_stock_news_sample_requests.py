@@ -94,6 +94,9 @@ DETAIL_FACT_REJECT_PHRASES = [
     # Generic filler
     "자료에는", "보고서에는", "항목이 포함됐다",
     "공개되지 않았다", "추후",
+
+    # Boilerplate detail fragments (취득 부대비용 주석·위임 문구 등)
+    "세부내용은 다음과 같이",
 ]
 
 STRICT_OUTPUT_SCHEMA = {
@@ -553,7 +556,10 @@ class BriefLoader:
         facts, hints = BriefTextCleaner.split_facts_and_hints(raw_safe)
 
         related_fact_groups = TextUtil.parse_json_dict_list(row.get("related_fact_groups_ko"))
-        best_related_group_facts = self._best_related_group_facts(related_fact_groups)
+        event_family = TextUtil.clean(row.get("event_family"))
+        best_related_group_facts = self._best_related_group_facts(
+            related_fact_groups, event_family
+        )
         layered_facts = TextUtil.dedupe(
             TextUtil.parse_json_list(row.get("official_detail_facts_ko"))
             + TextUtil.parse_json_list(row.get("main_source_facts_ko"))
@@ -564,8 +570,10 @@ class BriefLoader:
             for x in layered_facts
             if TextUtil.clean(x)
         ]
+        fact_source = TextUtil.dedupe(best_related_group_facts + layered_facts) or facts
+        fact_source = self._facts_for_family(fact_source, event_family)
         detail_source_facts = DetailFactBuilder.build(
-            facts=best_related_group_facts or layered_facts or facts,
+            facts=fact_source,
             max_detail_facts=self.config.max_detail_facts,
         )
 
@@ -595,7 +603,7 @@ class BriefLoader:
             stock_code=TextUtil.normalize_stock_code(row.get("stock_code")),
             stock_name=TextUtil.clean(row.get("stock_name")),
             anchor_date=TextUtil.normalize_date(row.get("anchor_date")),
-            event_family=TextUtil.clean(row.get("event_family")),
+            event_family=event_family,
             action_type=TextUtil.clean(row.get("action_type")),
             news_type=TextUtil.clean(row.get("news_type")),
             generation_readiness=TextUtil.clean(row.get("generation_readiness")),
@@ -614,8 +622,46 @@ class BriefLoader:
             restricted_fact_count=len(restricted),
         )
 
-    def _best_related_group_facts(self, groups: list[dict[str, Any]]) -> list[str]:
-        ranked: list[tuple[tuple[int, int, int], list[str]]] = []
+    # 이벤트 유형별로 뉴스의 핵심이 되어야 하는 팩트 키워드(앞쪽으로 정렬)
+    _FAMILY_FACT_KEYWORDS = {
+        "dividend": ("배당",),
+        "earnings": ("매출", "영업이익", "영업손실", "당기순이익", "순이익", "순손실"),
+        "contract": ("계약", "수주", "공급"),
+        "investment": ("투자", "취득", "처분", "양수", "양도", "지분", "거래 대상"),
+        "asset_transaction": ("취득", "처분", "양수", "양도", "투자"),
+        "equity_investment": ("지분", "거래 대상"),
+    }
+
+    @classmethod
+    def _prioritize_facts_by_family(cls, facts: list[str], event_family: str) -> list[str]:
+        """이벤트 유형에 맞는 핵심 팩트를 앞으로 끌어와 detail_source 선택에서 우선되게 한다.
+
+        예: 배당 공시인데 매출·영업이익 팩트가 먼저 와서 배당 팩트가 누락되는 문제를 막는다.
+        안정 정렬이라 유형 매칭 외 순서는 보존된다.
+        """
+        keywords = cls._FAMILY_FACT_KEYWORDS.get(event_family)
+        if not keywords or len(facts) <= 1:
+            return facts
+        return sorted(facts, key=lambda f: 0 if any(k in f for k in keywords) else 1)
+
+    @classmethod
+    def _facts_for_family(cls, facts: list[str], event_family: str) -> list[str]:
+        """Keep source facts that actually describe the requested event family.
+
+        Sorting alone is insufficient when max_detail_facts=1: an unrelated
+        earnings fact can otherwise become the sole source for a dividend row.
+        Unknown families retain the legacy behavior.
+        """
+        keywords = cls._FAMILY_FACT_KEYWORDS.get(event_family)
+        if not keywords:
+            return facts
+        return [fact for fact in facts if any(keyword in fact for keyword in keywords)]
+
+    def _best_related_group_facts(
+        self, groups: list[dict[str, Any]], event_family: str
+    ) -> list[str]:
+        ranked: list[tuple[tuple[int, int, int, int], list[str]]] = []
+        family_keywords = self._FAMILY_FACT_KEYWORDS.get(event_family, ())
 
         for group in groups:
             raw_facts = TextUtil.parse_json_list(group.get("facts_ko"))
@@ -628,16 +674,28 @@ class BriefLoader:
             if not facts:
                 continue
 
+            family_match_count = sum(
+                any(keyword in fact for keyword in family_keywords) for fact in facts
+            )
             support_bonus = 1 if group.get("has_supporting_fact") else 0
-            source_bonus = 1 if TextUtil.clean(group.get("source")) == "dart" else 0
-            score = (min(len(facts), self.config.max_detail_facts), support_bonus, source_bonus)
+            detail_bonus = (
+                1 if TextUtil.clean(group.get("source")) == "dart_disclosure_detail" else 0
+            )
+            score = (
+                1 if family_match_count else 0,
+                family_match_count,
+                detail_bonus,
+                support_bonus,
+            )
             ranked.append((score, facts))
 
         if not ranked:
             return []
 
         ranked.sort(key=lambda item: item[0], reverse=True)
-        return ranked[0][1][: self.config.max_detail_facts]
+        return self._prioritize_facts_by_family(ranked[0][1], event_family)[
+            : self.config.max_detail_facts
+        ]
 
     def _exclusion_reason(self, r: BriefRecord) -> str:
         if not r.bundle_id:
@@ -770,11 +828,18 @@ class PromptBuilder:
             "- You may make light grammatical edits for readability, but do not add interpretation.",
             "- If a fact contains Chinese or Japanese characters (CJK), use only the Latin/English transliteration in the fact, or describe the entity as '현지 자회사' or '중국 법인'. Do not output CJK characters in news_lines.",
             "",
-            "Earnings-style guidance (event_family = earnings):",
-            "- When writing two sentences about financial results, do NOT end both sentences with '공시됐다.'",
-            "- Preferred pattern: Line 1 states 매출액; Line 2 combines 영업이익 and 당기순이익 ending with '기록했다' or '집계됐다'.",
-            "- Example: '○○의 매출액은 약 ○조원으로 공시됐다. / 영업이익은 약 ○억원, 당기순이익은 약 ○억원을 기록했다.'",
-            "- Never end consecutive news_lines with the same verb.",
+            "Sentence-variety guidance (avoid mechanical repetition):",
+            "- Do NOT end every sentence with '공시됐다.' Combine related facts into natural sentences and vary the closing verb.",
+            "- Never end two consecutive news_lines with the same verb.",
+            "- When several facts share a subject, merge them into one fluent sentence instead of listing each as a separate '…으로 공시됐다.' line.",
+            "",
+            "Per-event-family writing patterns:",
+            "- earnings / 실적: Line 1 매출액('공시됐다'). Line 2 combines 영업이익·당기순이익 ending with '기록했다' or '집계됐다'. Example: '○○의 매출액은 약 ○조원으로 공시됐다. / 영업이익은 약 ○억원, 당기순이익은 약 ○억원을 기록했다.'",
+            "- contract / 계약: merge 계약금액·계약 상대방·계약 품목 into one sentence ending with '체결했다' or '수주했다'. Example: '○○는 △△와 약 ○억원 규모의 ○○ 공급계약을 체결했다.'",
+            "- dividend / 배당: state the dividend decision first ('현금배당을 결정했다' / '배당금 총액은 약 ○억원으로 결정됐다'), then a supporting figure if present.",
+            "- investment / asset_transaction: frame the amount as an action, e.g. '○○는 약 ○억원을 투자하기로 했다.' or '…자산을 취득했다.', and add the stated 목적 as a natural clause.",
+            "- equity_investment / 지분: '○○는 △△의 지분을 약 ○억원에 취득했다(처분했다).' and add 지분율 if present.",
+            "- Allowed closing verbs by context: 공시됐다, 결정했다/결정됐다, 체결했다, 수주했다, 취득했다, 처분했다, 투자하기로 했다, 기록했다, 집계됐다, 밝혔다.",
             "",
             "Forbidden writing:",
             "- Generic filler: 결정 자료에는..., 보고서에는..., 항목이 포함됐다, 공개되지 않았다, 추후 공지될 예정이다.",

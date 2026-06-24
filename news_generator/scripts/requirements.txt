@@ -23,3 +23,7 @@ tqdm>=4.66.0
 
 # 로깅·유틸리티
 python-dateutil>=2.8.2
+python-dotenv>=1.0.0
+
+# LLM 뉴스 생성
+openai>=1.0.0

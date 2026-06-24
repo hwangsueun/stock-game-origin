@@ -29,6 +29,9 @@ class MacroNewsInputConfig:
     input_path: Path
     output_path: Path
     report_path: Path
+    macro_event_calendar_path: Optional[Path] = None
+    official_release_calendar_path: Optional[Path] = None
+    context_overlay_path: Optional[Path] = None
 
     year: Optional[int] = None
     start_date: Optional[str] = None
@@ -201,11 +204,15 @@ class MacroNewsInputBuilder:
     ):
         self.config = config
         self.registry = registry or MacroColumnRegistry()
+        self.calendar_events = self._load_macro_event_calendar()
+        self.official_releases = self._load_official_release_calendar()
+        self.context_overlays = self._load_context_overlays()
 
     def run(self) -> None:
         df = self._load()
         df = self._prepare(df)
         df = self._filter_trading_days(df)
+        self._align_official_releases_to_trading_days(df)
         df = self._filter_period(df)
 
         records = []
@@ -263,9 +270,157 @@ class MacroNewsInputBuilder:
         df = df.sort_values(self.config.date_col)
         df = df.reset_index(drop=True)
 
+        # market_indicator 산출물은 원천 중심 이름을 쓰고, 이 빌더는 기사 중심
+        # canonical 이름을 쓴다. 값과 z-score를 함께 복사해 수집된 지표를 누락 없이 쓴다.
+        aliases = {
+            "kospi": "kospi_close",
+            "kosdaq": "kosdaq_close",
+            "gold_price": "gold",
+            "gold_price_ret_1d": "gold_ret_1d",
+            "wti_price": "wti",
+            "wti_price_ret_1d": "wti_ret_1d",
+            "ktb_3y_rate": "kr_3y_yield",
+            "ktb_10y_rate": "kr_10y_yield",
+            "ktb_10y_3y_spread": "term_spread_10y_3y",
+        }
+        for source, target in aliases.items():
+            if source in df.columns and target not in df.columns:
+                df[target] = df[source]
+            source_z = f"{source}_z"
+            target_z = f"{target}_z"
+            if source_z in df.columns and target_z not in df.columns:
+                df[target_z] = df[source_z]
+
+        # Dubai 원유 파일은 전 기간에 걸쳐 주기적인 20~300% 비정상 점프가 있어
+        # 기사 근거로 쓸 수 없다. WTI 마이너스 가격 전환일의 단순 수익률도 무의미하다.
+        if "wti_ret_1d" in df.columns:
+            invalid_wti_return = df["wti_ret_1d"].abs() > 50
+            df.loc[invalid_wti_return, "wti_ret_1d"] = np.nan
+            if "wti_ret_1d_z" in df.columns:
+                df.loc[invalid_wti_return, "wti_ret_1d_z"] = np.nan
+
+        # 이 파일들의 날짜는 실제 발표일이 아니라 참조월 1일이다. 발표일 매핑 없이
+        # LLM에 노출하면 look-ahead가 생기므로, 안전한 일별 입력에서는 사용하지 않는다.
+        unavailable_until_release_date_mapping = {
+            "cpi",
+            "leading_index",
+            "export_amount_usd_thousand",
+            "import_amount_usd_thousand",
+            "trade_balance_usd_thousand",
+            "industrial_production_index",
+            "mining_manufacturing_production_index",
+            "retail_sales_index",
+            "facility_investment_index",
+        }
+        for col in unavailable_until_release_date_mapping:
+            if col in df.columns:
+                df[col] = np.nan
+            z_col = f"{col}_z"
+            if z_col in df.columns:
+                df[z_col] = np.nan
+
         df = self._add_low_frequency_freshness_flags(df)
 
         return df
+
+    def _load_macro_event_calendar(self) -> Dict[str, List[Dict[str, Any]]]:
+        path = self.config.macro_event_calendar_path
+        if path is None:
+            return {}
+        if not path.exists():
+            raise FileNotFoundError(f"거시 사건 캘린더 없음: {path}")
+
+        calendar = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
+        required = {"event_date", "event_type", "title", "description", "direction", "severity"}
+        missing = required - set(calendar.columns)
+        if missing:
+            raise ValueError(f"거시 사건 캘린더 필수 컬럼 없음: {sorted(missing)}")
+
+        by_date: Dict[str, List[Dict[str, Any]]] = {}
+        for record in calendar.to_dict("records"):
+            date = str(record["event_date"]).strip()
+            if not date:
+                continue
+            by_date.setdefault(date, []).append(record)
+        return by_date
+
+    def _load_official_release_calendar(self) -> Dict[str, List[Dict[str, Any]]]:
+        path = self.config.official_release_calendar_path
+        if path is None:
+            return {}
+        if not path.exists():
+            raise FileNotFoundError(f"공식 발표 캘린더 없음: {path}")
+
+        calendar = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
+        required = {
+            "event_date", "source_release_date", "release_category", "region",
+            "institution", "title", "description", "direction", "severity",
+            "source_url", "key_figures_json", "verification_status",
+        }
+        missing = required - set(calendar.columns)
+        if missing:
+            raise ValueError(f"공식 발표 캘린더 필수 컬럼 없음: {sorted(missing)}")
+
+        approved_domains = (
+            "federalreserve.gov", "bok.or.kr", "bea.gov", "bls.gov",
+            "kostat.go.kr", "motie.go.kr",
+            # 국내 정책·법·정치 발표 레이어(build_policy_legal_releases.py)
+            "nec.go.kr", "assembly.go.kr", "ccourt.go.kr", "ftc.go.kr",
+            "fss.or.kr", "wikidata.org",
+        )
+        by_date: Dict[str, List[Dict[str, Any]]] = {}
+        for record in calendar.to_dict("records"):
+            if record["verification_status"] != "official_source_verified":
+                continue
+            source_url = record["source_url"].lower()
+            if not source_url.startswith("https://") or not any(
+                domain in source_url for domain in approved_domains
+            ):
+                raise ValueError(f"허용되지 않은 공식 발표 URL: {record['source_url']}")
+            try:
+                record["key_figures"] = json.loads(record["key_figures_json"])
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"공식 발표 key_figures_json 오류: {record['title']}") from exc
+            event_date = record["event_date"].strip()
+            if event_date:
+                by_date.setdefault(event_date, []).append(record)
+        return by_date
+
+    def _load_context_overlays(self) -> Dict[str, List[Dict[str, Any]]]:
+        path = self.config.context_overlay_path
+        if path is None:
+            return {}
+        if not path.exists():
+            raise FileNotFoundError(f"거시 컨텍스트 오버레이 없음: {path}")
+
+        overlays: Dict[str, List[Dict[str, Any]]] = {}
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                date = str(record.get("date") or "")
+                if date:
+                    overlays[date] = list(record.get("events") or [])
+        return overlays
+
+    def _align_official_releases_to_trading_days(self, df: pd.DataFrame) -> None:
+        if not self.official_releases:
+            return
+        trading_dates = pd.DatetimeIndex(pd.to_datetime(df[self.config.date_col])).sort_values()
+        aligned: Dict[str, List[Dict[str, Any]]] = {}
+        for calculated_date, records in self.official_releases.items():
+            target = pd.Timestamp(calculated_date)
+            position = trading_dates.searchsorted(target, side="left")
+            if position >= len(trading_dates):
+                continue
+            trading_date = trading_dates[position].strftime("%Y-%m-%d")
+            for record in records:
+                item = dict(record)
+                item["calculated_available_date_kr"] = calculated_date
+                item["event_date"] = trading_date
+                aligned.setdefault(trading_date, []).append(item)
+        self.official_releases = aligned
 
     def _filter_trading_days(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -462,8 +617,13 @@ class MacroNewsInputBuilder:
         events: List[MacroEvent] = []
 
         # 1. 핵심 이벤트
+        events.extend(self._build_context_overlay_events(date_str))
+        events.extend(self._build_official_release_events(date_str))
+        events.extend(self._build_calendar_events(date_str))
         events.extend(self._build_market_breadth_events(row, date_str))
         events.extend(self._build_index_detail_events(row, date_str))
+        if not self.official_releases:
+            events.extend(self._build_policy_rate_events(row, date_str))
         events.extend(self._build_rate_fx_events(row, date_str))
         events.extend(self._build_commodity_events(row, date_str))
         events.extend(self._build_real_activity_events(row, date_str))
@@ -493,6 +653,183 @@ class MacroNewsInputBuilder:
         events = self._apply_angle_caps(events)
 
         return events[: self.config.news_per_day]
+
+    def _build_context_overlay_events(self, date_str: str) -> List[MacroEvent]:
+        events = []
+        for record in self.context_overlays.get(date_str, []):
+            events.append(MacroEvent(
+                event_id=record["event_id"],
+                date=date_str,
+                macro_angle=record["macro_angle"],
+                angle_label=record["angle_label"],
+                market_implication=record["market_implication"],
+                direction=record["direction"],
+                severity=record["severity"],
+                source_columns=list(record.get("source_columns") or []),
+                evidence=dict(record.get("evidence") or {}),
+                key_figures=dict(record.get("key_figures") or {}),
+                event_role=record.get("event_role", "context"),
+            ))
+        return events
+
+    def _build_official_release_events(self, date_str: str) -> List[MacroEvent]:
+        angle_by_category = {
+            "monetary_policy": "money_flow",
+            "growth": "macro_regime",
+            "inflation": "policy_inflation",
+            "employment": "macro_regime",
+            "production": "macro_regime",
+            "trade": "external_pressure",
+            # 국내 정책·법·정치 발표(build_policy_legal_releases.py)
+            "legislation": "macro_regime",
+            "court_ruling": "risk_sentiment",
+            "election": "risk_sentiment",
+            "regulatory_action": "macro_regime",
+        }
+        # 카테고리별 허용 동사. 경제지표는 '발표했다'지만 입법·사법·선거·규제는 다르다.
+        # 붐비는 날 LLM이 능동/피동·다른 활용을 써도 통과하도록 행위 '어간'까지 포함(게이트 실패 근절).
+        release_verbs_by_category = {
+            "legislation": ["가결됐다", "의결됐다", "통과됐다", "처리됐다",
+                            "가결", "의결", "통과", "처리"],
+            "court_ruling": ["결정했다", "선고했다", "인용했다", "기각했다", "파면했다",
+                             "결정", "선고", "인용", "기각", "각하", "파면", "위헌", "해산"],
+            "election": ["실시됐다", "치러졌다", "진행됐다", "열렸다", "개최됐다",
+                         "실시", "치러", "개최", "투표"],
+            # 규제 조치는 표현이 다양(제재/과징금/시정명령/기업결합/동의의결)해 행위 어간까지 허용.
+            # 안내·현황 등 발표성 규제 공시도 있어 '발표' 계열도 포함.
+            "regulatory_action": [
+                "제재했다", "부과했다", "의결했다", "조치했다", "적발했다", "심의했다",
+                "결정했다", "명령했다", "고발했다", "처분했다", "착수했다", "개시했다", "승인했다",
+                "발표했다", "공개했다", "안내했다",
+                "제재", "과징금", "시정명령", "기업결합", "동의의결", "발표", "안내",
+            ],
+        }
+        severity_map = {
+            "critical": "strong", "high": "strong", "moderate": "moderate", "low": "weak",
+        }
+        events = []
+        for idx, record in enumerate(self.official_releases.get(date_str, []), start=1):
+            category = record["release_category"]
+            key_figures = dict(record["key_figures"])
+            institution = record["institution"]
+            if "FOMC" in institution:
+                institution_short = "FOMC"
+            elif "한국은행" in institution:
+                institution_short = "한국은행"
+            elif "BEA" in institution:
+                institution_short = "미국 BEA"
+            else:
+                institution_short = institution
+            if category == "monetary_policy":
+                action = str(key_figures.get("action") or "")
+                allowed_release_verbs = ["결정했다"]
+                if action:
+                    allowed_release_verbs.append(f"{action}했다")
+            elif category in release_verbs_by_category:
+                allowed_release_verbs = list(release_verbs_by_category[category])
+            else:
+                allowed_release_verbs = ["발표했다"]
+            direction = record["direction"]
+            if direction not in {"positive", "negative", "neutral", "mixed"}:
+                direction = "mixed"
+            events.append(MacroEvent(
+                event_id=f"{date_str}_official_release_{idx:02d}",
+                date=date_str,
+                macro_angle=angle_by_category.get(category, "macro_regime"),
+                angle_label=record["title"],
+                market_implication=record["description"],
+                direction=direction,
+                severity=severity_map.get(record["severity"], "moderate"),
+                source_columns=["official_release_calendar"],
+                evidence={
+                    "institution": institution,
+                    "required_attribution": institution_short,
+                    "allowed_release_verbs": allowed_release_verbs,
+                    "release_category": category,
+                    "source_release_date": record["source_release_date"],
+                    "available_date_kr": record["event_date"],
+                    "calculated_available_date_kr": record.get(
+                        "calculated_available_date_kr", record["event_date"]
+                    ),
+                    "reference_period": record.get("reference_period", ""),
+                    "official_description": record["description"],
+                    "source_url": record["source_url"],
+                    "verification_status": record["verification_status"],
+                },
+                key_figures=key_figures,
+                event_role="headline",
+            ))
+        return events
+
+    def _build_policy_rate_events(self, row: pd.Series, date_str: str) -> List[MacroEvent]:
+        specs = [
+            ("kr", "한국 기준금리", "kr_policy_rate", "kr_policy_rate_chg_1d_bp", "money_flow"),
+            ("us", "미국 정책금리", "us_policy_rate", "us_policy_rate_chg_1d_bp", "external_pressure"),
+        ]
+        events = []
+        for region, label, level_col, change_col, angle in specs:
+            level = self._get(row, level_col)
+            change_bp = self._get(row, change_col)
+            if level is None or change_bp is None or abs(change_bp) < 1:
+                continue
+            direction = "negative" if change_bp > 0 else "positive"
+            verb = "인상" if change_bp > 0 else "인하"
+            events.append(MacroEvent(
+                event_id=f"{date_str}_policy_rate_{region}",
+                date=date_str,
+                macro_angle=angle,
+                angle_label=f"{label} {verb}",
+                market_implication=f"{label}가 {abs(change_bp):g}bp {verb}돼 {level:g}%를 기록",
+                direction=direction,
+                severity="strong" if abs(change_bp) >= 25 else "moderate",
+                source_columns=[level_col, change_col],
+                evidence={level_col: level, change_col: change_bp},
+                key_figures={f"{level_col}_pct": f"{level:g}%", f"{change_col}": f"{change_bp:+g}bp"},
+                event_role="core",
+            ))
+        return events
+
+    def _build_calendar_events(self, date_str: str) -> List[MacroEvent]:
+        angle_by_type = {
+            "policy": "money_flow",
+            "geopolitics": "external_pressure",
+            "commodity": "policy_inflation",
+            "em": "external_pressure",
+            "financial": "risk_sentiment",
+            "pandemic": "macro_regime",
+        }
+        severity_map = {
+            "critical": "strong",
+            "high": "strong",
+            "moderate": "moderate",
+            "low": "weak",
+        }
+        events = []
+        for idx, record in enumerate(self.calendar_events.get(date_str, []), start=1):
+            event_type = record.get("event_type", "")
+            direction = record.get("direction", "mixed")
+            if direction not in {"positive", "negative", "neutral", "mixed"}:
+                direction = "mixed"
+            title = record.get("title", "주요 거시 사건")
+            events.append(MacroEvent(
+                event_id=f"{date_str}_calendar_{idx:02d}",
+                date=date_str,
+                macro_angle=angle_by_type.get(event_type, "macro_regime"),
+                angle_label=title,
+                market_implication=record.get("description", ""),
+                direction=direction,
+                severity=severity_map.get(record.get("severity", ""), "moderate"),
+                source_columns=["macro_event_calendar"],
+                evidence={
+                    "event_type": event_type,
+                    "region": record.get("region", ""),
+                    "description": record.get("description", ""),
+                    "affected_markets": record.get("affected_markets", ""),
+                },
+                key_figures={"event_title": title},
+                event_role="core",
+            ))
+        return events
 
     # --------------------------------------------------------
     # Core Event Builders
@@ -1279,6 +1616,32 @@ class MacroNewsInputBuilder:
                 "source_columns": ["gold", "gold_ret_1d", "gold_ret_1d_z"],
             },
             {
+                "event_id": f"{date_str}_support_credit_spread_context",
+                "angle": "money_flow",
+                "label": "회사채 신용스프레드 점검",
+                "implication": "회사채 AA-·BBB- 신용스프레드 수준으로 국내 신용 위험과 자금 조달 여건을 확인",
+                "direction_col": "corp_bbb_minus_spread",
+                "reverse_direction": True,
+                "source_columns": ["corp_aa_minus_spread", "corp_bbb_minus_spread"],
+            },
+            {
+                "event_id": f"{date_str}_support_us_rate_context",
+                "angle": "external_pressure",
+                "label": "미국 국채 금리와 장단기 스프레드 점검",
+                "implication": "미국 국채 2년·10년 금리와 장단기 스프레드로 글로벌 금리 부담을 확인",
+                "direction_col": "us_10y_yield",
+                "reverse_direction": True,
+                "source_columns": ["us_2y_yield", "us_10y_yield", "us_term_spread_10y_2y"],
+            },
+            {
+                "event_id": f"{date_str}_support_us_equity_context",
+                "angle": "risk_sentiment",
+                "label": "미국 증시 흐름 점검",
+                "implication": "S&P500과 나스닥 일간 수익률로 글로벌 위험자산 선호 강도를 확인",
+                "direction_col": "sp500_ret_1d",
+                "source_columns": ["sp500_close", "sp500_ret_1d", "nasdaq_close", "nasdaq_ret_1d"],
+            },
+            {
                 "event_id": f"{date_str}_support_gdelt_macro_context",
                 "angle": "risk_sentiment",
                 "label": "거시경제 뉴스 톤·보도량 점검",
@@ -1332,6 +1695,15 @@ class MacroNewsInputBuilder:
             if not valid_source_cols:
                 continue
 
+            signal_sources = {
+                col for col in valid_source_cols
+                if "ret_1d" in col or "spread" in col or col.endswith("_chg_1d_bp")
+            }
+            if signal_sources and any(
+                signal_sources & set(event.source_columns) for event in existing_events
+            ):
+                continue
+
             direction_value = self._get(row, spec["direction_col"])
             reverse = bool(spec.get("reverse_direction", False))
             direction = self._direction_from_value(direction_value, positive_when_up=not reverse)
@@ -1359,7 +1731,11 @@ class MacroNewsInputBuilder:
 
                 val = self._get(row, col)
                 if val is not None:
-                    if "ret_1d" in col:
+                    if "spread" in col:
+                        key_figures[f"{col}_pct_point"] = f"{val:g}%p"
+                    elif col.endswith("_z"):
+                        key_figures[col] = round(val, 2)
+                    elif "ret_1d" in col:
                         key_figures[f"{col}_pct"] = f"{val:+.2f}%"
                     else:
                         key_figures[col] = val
@@ -1531,6 +1907,8 @@ class MacroNewsInputBuilder:
             # 이벤트 사용 우선순위
             # --------------------------------------------------
             "event_priority": {
+                "00_headline": "거시 뉴스 편입 기준을 통과한 예외적으로 중요한 개별 종목 사건. 반드시 소화한다.",
+                "0_context": "검증된 섹터 확산도·업종 괴리 또는 예외적으로 큰 개별 종목 반응. 최우선 소화한다.",
                 "1_core": "z-score 기반 유의미한 움직임이 감지된 핵심 이벤트. 반드시 우선 소화한다.",
                 "2_support": "핵심 이벤트 보강용. 수치 흐름이 있으나 z 기준 미달인 경우.",
                 "3_fallback": "이벤트 수 부족 시에만 사용. 특정 사건을 지어내지 말고 지표 흐름 설명에 집중한다.",
@@ -1542,7 +1920,8 @@ class MacroNewsInputBuilder:
             "key_figures_usage": {
                 "rule": (
                     "각 이벤트의 key_figures에 담긴 수치를 헤드라인 또는 detail_news에 반드시 한 번 이상 사용한다. "
-                    "수치 없이 분위기만 서술하는 기사는 반려된다."
+                    "수치 없이 분위기만 서술하는 기사는 반려된다. 단, macro_event_calendar 사건은 "
+                    "캘린더의 사건명·설명·영향 시장을 근거로 쓰며 입력에 없는 수치를 만들지 않는다."
                 ),
                 "examples": [
                     "코스피가 1.4% 하락하며 사흘 만에 반락했다.",
@@ -1651,16 +2030,20 @@ class MacroNewsInputBuilder:
                     "S&P500·나스닥 등 미국 증시 흐름",
                     "미국 국채 금리 및 장단기 스프레드",
                     "미국 기준금리 및 통화정책 기대",
+                    "macro_event_calendar에 수록된 정책·금융·지정학·원자재·팬데믹 사건",
+                    "sector_context_daily 기반 업종 상승·하락 확산도와 시장 대비 업종 괴리",
+                    "split_article_reaction으로 검증된 예외적으로 큰 개별 종목 반응",
                 ],
                 "forbidden_topics": [
-                    "개별 기업 실적·이벤트",
+                    "context overlay에 포함되지 않은 개별 기업 실적·이벤트",
                     "특정 업종 투자의견 (반도체, 화학, 운송 등 개별 업종 리뷰)",
                     "입력 근거에 없는 기관명·인물명·정책 발표",
                     "미래 예측 (전망, 예상, ~할 것으로 보임)",
                 ],
                 "note": (
                     "daily_market_snapshot과 macro_events의 evidence·key_figures 범위 안에서만 기사를 쓴다. "
-                    "없는 사실을 만들지 않는다."
+                    "없는 사실을 만들지 않는다. major_stock 사건은 해당 종목의 큰 반응만 서술하고 "
+                    "시장 전체나 업종 움직임의 원인이라고 확대 해석하지 않는다."
                 ),
             },
 
@@ -1743,6 +2126,8 @@ class MacroNewsInputBuilder:
 
     def _rank_events(self, events: List[MacroEvent]) -> List[MacroEvent]:
         role_score = {
+            "headline": 5,
+            "context": 4,
             "core": 3,
             "support": 2,
             "fallback": 1,
@@ -1993,6 +2378,27 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--macro-event-calendar",
+        type=str,
+        default=None,
+        help="날짜가 검증된 주요 거시 사건 캘린더 CSV (선택)",
+    )
+
+    parser.add_argument(
+        "--official-release-calendar",
+        type=str,
+        default=None,
+        help="공식 URL·발표일·수치가 검증된 기관 발표 캘린더 CSV (선택)",
+    )
+
+    parser.add_argument(
+        "--context-overlay",
+        type=str,
+        default=None,
+        help="섹터 분위기와 중요 개별 종목 사건을 담은 날짜별 JSONL (선택)",
+    )
+
+    parser.add_argument(
         "--min-event-abs-z",
         type=float,
         default=1.0,
@@ -2036,6 +2442,13 @@ def main() -> None:
         input_path=Path(args.input_path),
         output_path=Path(output_path),
         report_path=Path(report_path),
+        macro_event_calendar_path=(
+            Path(args.macro_event_calendar) if args.macro_event_calendar else None
+        ),
+        official_release_calendar_path=(
+            Path(args.official_release_calendar) if args.official_release_calendar else None
+        ),
+        context_overlay_path=(Path(args.context_overlay) if args.context_overlay else None),
         year=args.year,
         start_date=args.start_date,
         end_date=args.end_date,

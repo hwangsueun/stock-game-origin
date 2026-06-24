@@ -38,9 +38,6 @@ class MacroCleanConfig:
 
     required_date_col: str = "date"
 
-    winsor_lower: float = 0.01
-    winsor_upper: float = 0.99
-
     rolling_window: int = 60
     min_periods: int = 20
 
@@ -93,7 +90,6 @@ class MacroSignalCleaner:
         df = self._create_return_columns(df)
         df = self._create_spread_columns(df)
         df = self._fill_missing_values(df)
-        df = self._winsorize_numeric_columns(df)
         df = self._create_rolling_zscores(df)
 
         report = self._build_quality_report(
@@ -276,31 +272,6 @@ class MacroSignalCleaner:
             df[numeric_cols] = df[numeric_cols].ffill()
 
         df[numeric_cols] = df[numeric_cols].bfill()
-
-        return df
-
-    # --------------------------------------------------------
-    # Winsorize
-    # --------------------------------------------------------
-
-    def _winsorize_numeric_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-
-        numeric_cols = self._get_numeric_cols(df)
-
-        for col in numeric_cols:
-            series = df[col]
-
-            if series.notna().sum() < 30:
-                continue
-
-            lower = series.quantile(self.config.winsor_lower)
-            upper = series.quantile(self.config.winsor_upper)
-
-            if pd.isna(lower) or pd.isna(upper) or lower >= upper:
-                continue
-
-            df[col] = series.clip(lower=lower, upper=upper)
 
         return df
 

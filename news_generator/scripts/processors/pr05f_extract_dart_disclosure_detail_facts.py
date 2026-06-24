@@ -214,6 +214,10 @@ class DisclosureDetailExtractor:
     def _extract_by_report_name(self, candidate: Candidate, text: str) -> list[dict[str, str]]:
         title = normalize_title(candidate.report_name)
         facts: list[dict[str, str]] = []
+        issuer_name = self._extract_issuer_name(text)
+        if issuer_name:
+            facts.append(self._fact("issuer_name_as_filed", f"공시 당시 회사명은 '{issuer_name}'이다."))
+        facts.extend(self._extract_correction_meta(text))
         if "배당" in title:
             facts.extend(self._extract_dividend(candidate, text))
         if "매출액또는손익구조" in title:
@@ -236,12 +240,62 @@ class DisclosureDetailExtractor:
             deduped.append(fact)
         return deduped[:8]
 
+    @staticmethod
+    def _extract_issuer_name(text: str) -> str:
+        pattern = (
+            r"([가-힣A-Za-z0-9&().·ㆍ\- ]{2,60})/"
+            r"(?:단일판매|매출액\s*또는\s*손익구조|매출액또는손익구조|"
+            r"현금[ㆍ·]현물배당|신규시설투자|유형자산|타법인주식)"
+        )
+        match = re.search(pattern, text)
+        if not match:
+            return ""
+        value = clean(match.group(1)).strip(" -")
+        # CSS 텍스트가 앞에 붙은 비정상 경우 마지막 한글/영문 토큰만 보존.
+        if len(value) > 35 and " " in value:
+            value = value.split()[-1]
+        return value
+
+    def _extract_correction_meta(self, text: str) -> list[dict[str, str]]:
+        correction_markers = re.compile(
+            r"정정사항\s+정정항목|정정사유\s*[:：]|"
+            r"정정공시(?:\s*\(|\s*사항)|정정신고\s*\(보고\)\s*서"
+        )
+        if not correction_markers.search(text[:12000]):
+            return []
+        facts = [self._fact("is_correction", "기존 공시의 정정 공시다.")]
+        reason_patterns = [
+            # '주요 변경내용' 섹션: 정정사유: ... - 주요 정정사항
+            r"정정사유\s*[:：]\s*(.+?)(?=\s*-?\s*주요\s+정정사항)",
+            # 일반 정정신고서 표: 정정사유 ... 4. 정정사항
+            r"정정사유\s*[:：]?\s*(.+?)(?=\s+(?:\d+\.\s*)?정정사항|\s+정정사항\s+정정항목)",
+            # 본문 괄호형: 정정공시(정정사유 : 변경계약 체결)
+            r"정정사유\s*[:：]\s*([^)\]]+?)(?=\s*[)\]])",
+        ]
+        for pattern in reason_patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            reason = clean(match.group(1)).strip(" -:：")
+            if reason:
+                facts.append(
+                    self._fact(
+                        "correction_reason",
+                        f"정정 사유는 '{cap(reason, 140)}'라고 공시됐다.",
+                        source_text=reason,
+                    )
+                )
+                break
+        return facts
+
     def _fact(self, fact_type: str, text_ko: str, source_text: str = "") -> dict[str, str]:
         return {
             "fact_type": fact_type,
             "relation_scope": "same_dart_rcept_no",
             "text_ko": cap(text_ko, 170),
-            "source_text_ko": cap(source_text or text_ko, 220),
+            # Preserve long correction reasons for classification/audit. The
+            # shorter text_ko remains the write-facing representation.
+            "source_text_ko": cap(source_text or text_ko, 1000),
         }
 
     def _extract_dividend(self, candidate: Candidate, text: str) -> list[dict[str, str]]:
@@ -257,12 +311,26 @@ class DisclosureDetailExtractor:
             facts.append(self._fact("record_date", f"{candidate.stock_name}의 배당 기준일은 {clean(record_date)}로 공시됐다."))
         return facts
 
+    # 단일 상장사 연간 매출액의 현실적 상한(원). 이 데이터셋 합법 최대는 현대차 약 143조.
+    # 헤더 단위 적용 결과가 이 값을 넘으면 단위가 과대(예: 원인데 천원으로 오기) 처리된 것으로 보고
+    # ÷1000 단계 보정한다. 368조(한솔 오기) 등 명백한 오류만 잡히고 합법 대형주는 영향 없음.
+    _SALES_PLAUSIBLE_CEILING_WON = 300_000_000_000_000
+
     def _extract_sales_profit_change(self, candidate: Candidate, text: str) -> list[dict[str, str]]:
         facts: list[dict[str, str]] = []
+        scope_match = re.search(r"재무제표의\s*종류\s*(연결|별도)", text)
+        if scope_match:
+            facts.append(self._fact("statement_scope", f"재무제표는 {scope_match.group(1)} 기준으로 공시됐다."))
+        unit_to_won = self._detect_statement_unit(text)
+        unit_to_won = self._sanity_adjust_unit(self._financial_statement_row_value(text, "매출액"), unit_to_won)
+        # 셀 단위 오기(예: 같은 천원 표에서 당기순이익만 원으로 입력) 보정용 앵커: 법인세차감전이익.
+        anchor_won = self._statement_anchor_won(text, unit_to_won)
         for label, fact_type in [("매출액", "sales"), ("영업이익", "operating_profit"), ("당기순이익", "net_income")]:
             value = self._financial_statement_row_value(text, label)
             if value:
-                amount_text = self._format_thousand_krw(value)
+                # 매출액은 앵커 검증 대상에서 제외(이미 크기 가드 적용됨).
+                cell_anchor = None if fact_type == "sales" else anchor_won
+                amount_text = self._format_krw_amount(value, unit_to_won, anchor_won=cell_anchor)
                 if value.startswith("-") and label == "영업이익":
                     facts.append(self._fact(fact_type, f"{candidate.stock_name}의 영업손실은 {amount_text.lstrip('-').replace('약 -', '약 ')}으로 공시됐다."))
                 elif value.startswith("-") and label == "당기순이익":
@@ -308,6 +376,9 @@ class DisclosureDetailExtractor:
         facts: list[dict[str, str]] = []
         amount = self._near_amount(text, ["투자금액", "취득금액", "양수금액"])
         purpose = self._near_text(text, ["투자목적", "취득목적", "양수목적"], max_chars=120)
+        purpose = re.sub(r"^\s*\(?\d+\)?\s*[.)]?\s*", "", purpose)  # 선두 '(1)' 등 열거 마커 제거
+        if len(re.findall(r"[가-힣]", purpose)) < 4:  # 의미있는 한글 4자 미만이면 버림
+            purpose = ""
         detail = self._extract_investment_detail(text)
         if amount:
             facts.append(self._fact("investment_amount", f"{candidate.stock_name}의 관련 투자·취득 금액은 {amount}으로 공시됐다."))
@@ -442,7 +513,9 @@ class DisclosureDetailExtractor:
         facts: list[dict[str, str]] = []
         amount = self._near_amount(text, ["계약금액"])
         counterparty = self._near_text(text, ["계약상대", "상대방"], max_chars=70)
-        item = self._near_text(text, ["계약품목", "품목", "계약내용", "공급내용"], max_chars=100)
+        item = self._extract_contract_item(text) or self._near_text(
+            text, ["계약품목", "품목", "계약내용", "공급내용"], max_chars=100
+        )
         detail = self._extract_contract_detail(text)
         if amount:
             facts.append(self._fact("contract_amount", f"{candidate.stock_name}의 계약금액은 {amount}으로 공시됐다."))
@@ -453,6 +526,22 @@ class DisclosureDetailExtractor:
         if detail:
             facts.append(self._fact("contract_detail", f"{candidate.stock_name}의 계약 관련 주요사항: {detail}"))
         return facts
+
+    @staticmethod
+    def _extract_contract_item(text: str) -> str:
+        """체결계약명/세부내용을 다음 '계약내역' 섹션 전까지만 추출한다."""
+        patterns = [
+            r"체결계약명\s+(.+?)\s+2\.\s*계약내역",
+            r"세부내용\s*-?\s*(.+?)\s+2\.\s*계약내역",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            value = clean(match.group(1)).strip(" -:：")
+            if value and value not in {"-", "해당없음"} and len(value) <= 120:
+                return value
+        return ""
 
     def _extract_contract_detail(self, text: str) -> str:
         """기타 투자판단과 관련한 중요사항에서 계약 목적·배경 문구를 추출한다."""
@@ -489,7 +578,17 @@ class DisclosureDetailExtractor:
         return ""
 
     @staticmethod
-    def _format_amount(value: str, unit: str) -> str:
+    def _eok_to_text(eok: int) -> str:
+        """억 단위 정수를 '약 N조M억원' 형태로 굴려 표기."""
+        jo, rem_eok = divmod(int(eok), 10000)
+        if jo > 0 and rem_eok > 0:
+            return f"약 {jo}조{rem_eok:,}억원"
+        if jo > 0:
+            return f"약 {jo}조원"
+        return f"약 {rem_eok:,}억원"
+
+    @classmethod
+    def _format_amount(cls, value: str, unit: str) -> str:
         raw = clean(value).replace(",", "")
         try:
             number = float(raw)
@@ -497,21 +596,17 @@ class DisclosureDetailExtractor:
             return f"{clean(value)}{unit}"
 
         if unit == "억원":
+            if number >= 10000 and number.is_integer():
+                return cls._eok_to_text(int(number))
             if number.is_integer():
                 return f"{int(number):,}억원"
             return f"{number:,.2f}".rstrip("0").rstrip(".") + "억원"
         if unit == "백만원":
             eok = round(number / 100)
             if eok >= 1:
-                jo, rem_eok = divmod(eok, 10000)
-                if jo > 0 and rem_eok > 0:
-                    return f"약 {jo}조{rem_eok:,}억원"
-                if jo > 0:
-                    return f"약 {jo}조원"
-                return f"약 {rem_eok:,}억원"
+                return cls._eok_to_text(eok)
         if unit == "원" and number >= 100000000:
-            eok = round(number / 100000000)
-            return f"약 {eok:,}억원"
+            return cls._eok_to_text(round(number / 100000000))
         if unit == "원" and number < 100000000:
             return ""
 
@@ -544,18 +639,28 @@ class DisclosureDetailExtractor:
                 continue
             window = text[idx + len(label): idx + len(label) + 260]
             window = re.sub(r"^[\s:：\-ㆍ·|]+", "", window)
+            # 다음 필드 라벨에서 자른다. '회사와의 관계'(의 포함)·국적(괄호 포함)도 처리.
             window = re.split(
-                r"\s+(?:국적|대표자|자본금|회사와 관계|발행주식총수|주요사업|취득내역|취득금액|"
+                r"\s*-?\s*회사와의?\s*관계",
+                window,
+            )[0]
+            window = re.split(
+                r"\s+(?:국적|대표자|자본금|발행주식총수|주요사업|취득내역|취득금액|"
                 r"자기자본|지분비율|취득방법|취득목적|취득예정일자|이사회결의일|대규모법인여부)\s+",
                 window,
             )[0]
             window = re.split(r"\s{2,}|(?<=다\.)|(?<=\. )|(?<=\))", window)[0]
             value = clean(window).strip(" :：-ㆍ·|")
+            value = re.sub(r"\(?\s*국적\s*\)?", "", value)  # '(국적)' 잔여물 제거
             value = re.sub(r"\s+\d+\.$", "", value)
             value = re.sub(r"^미정\s+", "", value)
             value = re.sub(r"^(?:대표자\s+)?회사명\s*[:：]\s*", "", value)
             value = re.sub(r"^대표자\s+", "", value)
             value = re.sub(r"^회사명\s+", "", value)
+            value = re.sub(r"^[방향]\s+", "", value)  # '상대방' 분리 시 남는 stray '방 '
+            value = re.sub(r"(주식회사)\s+\1", r"\1", value)  # '주식회사 주식회사' 중복
+            value = re.sub(r"\b(\S+)\s+\1\b", r"\1", value)  # 인접 토큰 중복
+            value = clean(value).strip(" :：-ㆍ·|")
             if value == "미정":
                 return ""
             compact = re.sub(r"\s+", "", value)
@@ -569,6 +674,10 @@ class DisclosureDetailExtractor:
             if compact in invalid_values:
                 return ""
             if compact.startswith("대표자자본금") or "자본금" in compact or "발행회사명" in compact:
+                return ""
+            if compact in {"주식회사", "(주)", "㈜", "회사", "회사명", "국적"}:
+                return ""
+            if not re.search(r"[가-힣A-Za-z0-9]", value):  # 문장부호만 남은 경우
                 return ""
             if 2 <= len(value) <= max_chars:
                 return value
@@ -586,20 +695,83 @@ class DisclosureDetailExtractor:
         return f"{stock_name}{'은' if has_batchim else '는'}"
 
     @staticmethod
-    def _format_thousand_krw(value: str) -> str:
+    def _detect_statement_unit(text: str) -> int:
+        """변동내용 표의 '(단위: 원/천원/백만원)'을 읽어 원 환산 배수를 반환.
+
+        DART '매출액또는손익구조변동' 공시는 표마다 단위가 다르다(천원 989건, 원 284건).
+        단위 표기 위치가 공시 포맷마다 다르다: 헤더 직후(변동내용(단위:원))인 경우도 있고,
+        값이 먼저 나오고 표 하단에 표기되는 경우도 있다(예: 변동내용(당해사업연도) -매출액:…
+        … 단위: 원). 값 추출과 동일한 변동내용~대규모법인여부 섹션 전체에서 첫 단위 표기를
+        찾는다. 표기가 없으면 다수 케이스인 천원으로 가정한다.
+        """
+        start = text.find("변동내용")
+        section = text[start:] if start >= 0 else text
+        end = section.find("대규모법인여부")
+        if end >= 0:
+            section = section[:end]
+        elif len(section) > 2000:
+            section = section[:2000]
+        match = re.search(r"단위\s*[:：]?\s*(백만원|천원|원)", section)
+        unit = match.group(1) if match else "천원"
+        return {"원": 1, "천원": 1_000, "백만원": 1_000_000}[unit]
+
+    @classmethod
+    def _sanity_adjust_unit(cls, sales_value: str, unit_to_won: int) -> int:
+        """매출액 크기로 단위 표기를 검증해 과대 단위를 ÷1000 보정한다.
+
+        헤더 단위가 없거나(KMW) 잘못 표기된(한솔: 천원이라 쓰고 값은 원) 공시에서
+        매출액이 비현실적으로 커지는 경우를 잡는다. 합법적 대형주(현대차 143조 등)는
+        상한 미만이라 영향 없으며, 단위를 키우는 방향으로는 절대 바꾸지 않는다.
+        """
+        if not sales_value:
+            return unit_to_won
+        try:
+            raw = abs(int(float(clean(sales_value).replace(",", ""))))
+        except ValueError:
+            return unit_to_won
+        while unit_to_won > 1 and raw * unit_to_won > cls._SALES_PLAUSIBLE_CEILING_WON:
+            unit_to_won //= 1_000
+        return unit_to_won
+
+    @classmethod
+    def _statement_anchor_won(cls, text: str, unit_to_won: int) -> int | None:
+        """자산총계를 셀 단위 오기 검증용 앵커(원)로 반환.
+
+        매출·영업이익·당기순이익이 자산총계를 크게 초과하는 것은 물리적으로 불가능하므로
+        자산총계가 가장 견고한 상한 앵커다. (법인세차감전'계속사업'이익은 분할 시 중단영업
+        이익을 포함하는 당기순이익을 과소평가해 부적절 — 예: 솔브레인홀딩스 분할이익.)
+        재무현황 표는 변동내용 표 뒤에 있어 별도 패턴으로 추출한다.
+        """
+        m = re.search(r"자산총계\s*[:：]?\s*(-?\d[\d,]{5,})", text)
+        if not m:
+            return None
+        try:
+            return abs(int(float(m.group(1).replace(",", "")))) * unit_to_won
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _format_krw_amount(value: str, unit_to_won: int = 1_000, anchor_won: int | None = None) -> str:
         raw = clean(value).replace(",", "")
         sign = ""
         if raw.startswith("-"):
             sign = "-"
             raw = raw[1:]
         try:
-            thousand_krw = int(float(raw))
+            won = int(float(raw)) * unit_to_won
         except ValueError:
-            return clean(value) + "천원"
+            return clean(value)
 
-        eok = round(thousand_krw / 100000)
+        # 셀 단위 오기 보정: 매출/이익이 자산총계의 2배를 넘으면 그 셀만 1000배 과대 입력된 것으로
+        # 보고 ÷1000. 한 해 손익이 총자산의 2배를 넘는 것은 물리적으로 불가능 → 명백한 오류.
+        # (예: BGF 순이익 3.5조 vs 자산 8,582억 → 35억). 분할 중단영업이익으로 순이익≈자산인
+        # 합법 케이스(솔브레인홀딩스 순이익 1.43조 vs 자산 1.34조)는 보존된다.
+        if anchor_won and anchor_won > 0 and won > anchor_won * 2 and won >= 100_000_000:
+            won //= 1_000
+
+        eok = round(won / 100_000_000)
         if eok <= 0:
-            return sign + f"{thousand_krw:,}천원"
+            return sign + f"{won:,}원"
 
         jo, rem_eok = divmod(eok, 10000)
         prefix = "약 "

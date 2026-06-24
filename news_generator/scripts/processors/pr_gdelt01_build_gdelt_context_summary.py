@@ -651,7 +651,7 @@ class KoreaRelevance:
     KOREA_TEXT = r"\b(?:KOREA|SOUTH KOREA|SEOUL|KOREAN)\b"
     @classmethod
     def is_korea_text(cls, text: str) -> bool:
-        return bool(cls.KOREA_TEXT.search(clean_text(text)))
+        return bool(re.search(cls.KOREA_TEXT, clean_text(text), flags=re.IGNORECASE))
 
     @classmethod
     def is_korea_code(cls, value: Any) -> bool:
@@ -1735,6 +1735,7 @@ class GdeltContextSummaryPipeline:
 
         file_counts: Counter = Counter()
         row_counts: Counter = Counter()
+        failures: List[Tuple[str, str]] = []
 
         for idx, path in enumerate(paths, start=1):
             kind = self._kind(path)
@@ -1752,6 +1753,14 @@ class GdeltContextSummaryPipeline:
                 print(f"  processed_rows: {n:,}")
             except Exception as exc:
                 print(f"  [SKIP] reason={exc}")
+                failures.append((path.name, str(exc)))
+
+        if failures:
+            preview = "; ".join(f"{name}: {reason}" for name, reason in failures[:10])
+            raise RuntimeError(
+                f"GDELT processing failed for {len(failures)}/{len(paths)} files; "
+                f"no output written. First failures: {preview}"
+            )
 
         all_df = self.accumulator.to_dataframe()
         main_df, quarantine_df, preview_df = self.splitter.split(all_df)
